@@ -108,7 +108,7 @@ input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-
 ul.rules{margin:4px 0 0;padding-left:18px;font-size:14px}
 ul.rules li{margin-bottom:6px}
 .x{background:none;border:0;color:var(--muted);font-size:20px;cursor:pointer;padding:4px 8px}
-.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:650;background:var(--track);color:var(--muted)}
+.pill{display:inline-block;white-space:nowrap;flex:none;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:650;background:var(--track);color:var(--muted)}
 .pill.ok{background:var(--accent-soft);color:var(--accent)}
 </style>
 </head>
@@ -296,20 +296,36 @@ function renderToday(){
 function jpeg(file,max,q){return new Promise((res,rej)=>{const url=URL.createObjectURL(file),img=new Image();img.onload=()=>{const s=Math.min(1,max/Math.max(img.naturalWidth,img.naturalHeight)),c=document.createElement('canvas');c.width=Math.round(img.naturalWidth*s);c.height=Math.round(img.naturalHeight*s);c.getContext('2d').drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(url);res(c.toDataURL('image/jpeg',q))};img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error('Could not read that image'))};img.src=url})}
 
 const SYS=`You estimate the nutrition of a single meal for a calorie-tracking app. You receive a photo and/or a short note from the user (what it is, how it was cooked, how much they ate). Estimate realistically: include cooking oil or butter, sauces, dressings, cheese and drinks that are visible or mentioned. If the user says they ate only part, scale to what they ate. Restaurant food is usually more calorie-dense than home cooking. If unsure between two sizes, pick the more likely one rather than the lowest.
-Reply with ONLY a JSON object, no prose, exactly in this shape:
-{"name":"short meal name","kcal":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fibre_g":0,"confidence":"low|medium|high","items":[{"item":"...","kcal":0,"protein_g":0}],"tip":"one practical sentence under 20 words"}
+Always record the result by calling the log_meal tool. Write the name, item names and tip in the same language as the user's note (English if there is no note). Keep the items list short — at most 8 entries.
 The tip should help the user finish the day high in protein and fibre within what they have left.`;
-async function claude(content,maxTokens=1000){
-  const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':S.settings.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:S.settings.model,max_tokens:maxTokens,system:SYS,messages:[{role:'user',content}]})});
+const MEAL_TOOL={name:'log_meal',description:'Record the nutrition estimate for this meal.',input_schema:{type:'object',properties:{
+  name:{type:'string',description:'Short meal name'},kcal:{type:'number'},protein_g:{type:'number'},carbs_g:{type:'number'},fat_g:{type:'number'},fibre_g:{type:'number'},
+  confidence:{type:'string',enum:['low','medium','high']},
+  items:{type:'array',items:{type:'object',properties:{item:{type:'string'},kcal:{type:'number'},protein_g:{type:'number'}},required:['item','kcal']}},
+  tip:{type:'string',description:'One practical sentence under 20 words'}},
+  required:['name','kcal','protein_g','carbs_g','fat_g','fibre_g','confidence']}};
+async function callApi(body){
+  const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'content-type':'application/json','x-api-key':S.settings.apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify({model:S.settings.model,system:SYS,...body})});
   if(!r.ok){let m=`${r.status}`;try{const j=await r.json();m+=' — '+(j.error?.message||'')}catch(e){}throw new Error('API error '+m)}
-  const j=await r.json();return j.content.filter(c=>c.type==='text').map(c=>c.text).join('');
+  return r.json();
+}
+async function claude(content,maxTokens=1000){
+  const j=await callApi({max_tokens:maxTokens,messages:[{role:'user',content}]});
+  return j.content.filter(c=>c.type==='text').map(c=>c.text).join('');
 }
 async function estimate(img,note,excludeId){
   const T=targets(),t=totals(view),own=excludeId?dayR(view).meals.find(m=>m.id===excludeId):null;
   const kLeft=T.kcal-t.kcal+(own?+own.kcal||0:0),pLeft=T.protein-t.protein+(own?+own.protein||0:0);
   const content=[];if(img)content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:img.split(',')[1]}});
   content.push({type:'text',text:`User's note: ${note||'(none)'}\nBefore this meal they have ${fmt(kLeft)} kcal and ${fmt(pLeft)} g protein left today (daily target ${fmt(T.kcal)} kcal, ${fmt(T.protein)} g protein, 30 g fibre).${img?'':' No photo — estimate from the note only.'}`});
-  const text=await claude(content);const m=text.match(/\{[\s\S]*\}/);if(!m)throw new Error('Could not read the estimate — try again');return JSON.parse(m[0]);
+  // Forced tool call: the API hands back a parsed object, so there is no JSON text to break
+  const j=await callApi({max_tokens:2000,tools:[MEAL_TOOL],tool_choice:{type:'tool',name:'log_meal'},messages:[{role:'user',content}]});
+  const use=(j.content||[]).find(c=>c.type==='tool_use');
+  if(use&&use.input&&isFinite(+use.input.kcal))return use.input;
+  // fallback: try to salvage numbers from any text reply
+  const text=(j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
+  const m=text.match(/\{[\s\S]*\}/);if(m){try{return JSON.parse(m[0])}catch(e){}}
+  throw new Error(j.stop_reason==='max_tokens'?'The estimate was cut off — try a shorter note':'Could not read the estimate — tap Re-estimate');
 }
 
 function mealSheet(id){

@@ -1,5 +1,5 @@
 // Lean Me Down — offline support. Bump VERSION whenever you upload a new index.html.
-const VERSION = 'leanme-v1';
+const VERSION = 'leanme-v2';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
