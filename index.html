@@ -318,14 +318,32 @@ async function estimate(img,note,excludeId){
   const kLeft=T.kcal-t.kcal+(own?+own.kcal||0:0),pLeft=T.protein-t.protein+(own?+own.protein||0:0);
   const content=[];if(img)content.push({type:'image',source:{type:'base64',media_type:'image/jpeg',data:img.split(',')[1]}});
   content.push({type:'text',text:`User's note: ${note||'(none)'}\nBefore this meal they have ${fmt(kLeft)} kcal and ${fmt(pLeft)} g protein left today (daily target ${fmt(T.kcal)} kcal, ${fmt(T.protein)} g protein, 30 g fibre).${img?'':' No photo — estimate from the note only.'}`});
-  // Forced tool call: the API hands back a parsed object, so there is no JSON text to break
-  const j=await callApi({max_tokens:2000,tools:[MEAL_TOOL],tool_choice:{type:'tool',name:'log_meal'},messages:[{role:'user',content}]});
-  const use=(j.content||[]).find(c=>c.type==='tool_use');
-  if(use&&use.input&&isFinite(+use.input.kcal))return use.input;
-  // fallback: try to salvage numbers from any text reply
-  const text=(j.content||[]).filter(c=>c.type==='text').map(c=>c.text).join('');
-  const m=text.match(/\{[\s\S]*\}/);if(m){try{return JSON.parse(m[0])}catch(e){}}
-  throw new Error(j.stop_reason==='max_tokens'?'The estimate was cut off — try a shorter note':'Could not read the estimate — tap Re-estimate');
+  // Tool call: the API hands back a parsed object, so there is no JSON text to break.
+  // tool_choice stays "auto" because some models reject a forced tool choice.
+  const messages=[{role:'user',content}];
+  for(let attempt=0;attempt<2;attempt++){
+    const j=await callApi({max_tokens:4000,tools:[MEAL_TOOL],tool_choice:{type:'auto'},messages});
+    const blocks=j.content||[];
+    const use=blocks.find(c=>c.type==='tool_use'&&c.name==='log_meal');
+    if(use&&use.input&&isFinite(+use.input.kcal))return use.input;
+    const text=blocks.filter(c=>c.type==='text').map(c=>c.text).join('');
+    const salvaged=looseJson(text);if(salvaged)return salvaged;
+    if(j.stop_reason==='max_tokens')throw new Error('The estimate was cut off — try a shorter note');
+    // nudge once: ask it to record the estimate with the tool
+    messages.push({role:'assistant',content:blocks.length?blocks:[{type:'text',text:text||'...'}]});
+    if(use)messages.push({role:'user',content:[{type:'tool_result',tool_use_id:use.id,content:'Missing kcal — call log_meal again with all fields.',is_error:true}]});
+    else messages.push({role:'user',content:'Please record that estimate now by calling the log_meal tool.'});
+  }
+  throw new Error('Could not read the estimate — tap Re-estimate');
+}
+function looseJson(text){ // last-resort parse of a JSON-ish text reply
+  const m=(text||'').match(/\{[\s\S]*\}/);if(!m)return null;
+  const tries=[m[0],m[0].replace(/,\s*([\]}])/g,'$1').replace(/}\s*{/g,'},{').replace(/[„”“]/g,'"')];
+  for(const t of tries){try{const o=JSON.parse(t);if(isFinite(+o.kcal))return o}catch(e){}}
+  const n=k=>{const r=text.match(new RegExp('"'+k+'"\\s*:\\s*(\\d+(?:\\.\\d+)?)'));return r?+r[1]:0};
+  const kcal=n('kcal');if(!kcal)return null;
+  const name=(text.match(/"name"\s*:\s*"([^"]*)"/)||[])[1];
+  return{name,kcal,protein_g:n('protein_g'),carbs_g:n('carbs_g'),fat_g:n('fat_g'),fibre_g:n('fibre_g'),confidence:'low'};
 }
 
 function mealSheet(id){
